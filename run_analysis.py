@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 import scipy.stats as stats
 import os
 
-# Paramètres globaux
 RHO = -0.5
 plt.style.use('ggplot')
 
@@ -17,8 +16,6 @@ def compile_codes():
         exit(1)
 
     print("2. Génération et compilation de l'utilitaire gamma_test.cu...")
-    # FIX: Ajout du 'r' (raw string) devant les guillemets pour empêcher Python 
-    # de mal interpréter les '\n' et le code CUDA à la génération du fichier C.
     gamma_cu = r"""
     #include <stdio.h>
     #include <stdlib.h>
@@ -77,7 +74,6 @@ def compile_codes():
         get_gamma<<<(n+255)/256, 256>>>(d_state, alpha, d_out, n);
         cudaDeviceSynchronize();
         
-        // FIX: Ecriture dans un fichier plutot que stdout
         FILE *f = fopen("gamma_samples.txt", "w");
         for(int i=0; i<n; i++) fprintf(f, "%f\n", d_out[i]);
         fclose(f);
@@ -99,15 +95,14 @@ def run_heston(method, kappa, theta, sigma, rho, n_steps, n_sims):
     cmd = f"./heston {method} {kappa} {theta} {sigma} {rho} {n_steps} {n_sims}"
     res = subprocess.run(cmd.split(), capture_output=True, text=True)
     if res.returncode != 0:
-        return np.nan, np.nan
+        return np.nan, np.nan, np.nan
     try:
-        # Nettoyage sécurisé pour la lecture stdout
         output = res.stdout.strip().split(',')
-        if len(output) != 2:
-            return np.nan, np.nan
-        return float(output[0]), float(output[1])
+        if len(output) != 3: # On attend maintenant 3 valeurs
+            return np.nan, np.nan, np.nan
+        return float(output[0]), float(output[1]), float(output[2])
     except:
-        return np.nan, np.nan
+        return np.nan, np.nan, np.nan
 
 # ==========================================
 # FIGURES GÉNÉRATION
@@ -117,21 +112,21 @@ def fig1_euler_convergence():
     print("Génération Figure 1 : Convergence Euler...")
     n_sims_list =[1000, 5000, 10000, 50000, 100000, 500000, 1000000]
     prices_mean = []
-    prices_std =[]
+    prices_ci = []
     
-    # FIX: 10 runs au lieu de 5 pour une meilleure estimation de la variance
+    # Remplacement de la boucle de 10 runs par une utilisation propre de l'erreur standard
     for n in n_sims_list:
-        runs =[run_heston(0, 0.5, 0.1, 0.3, RHO, 1000, n)[0] for _ in range(10)]
-        valid_runs = [r for r in runs if not np.isnan(r)]
-        if len(valid_runs) > 0:
-            prices_mean.append(np.mean(valid_runs))
-            prices_std.append(np.std(valid_runs) + 1e-6)
+        p_mean, std_err, _ = run_heston(0, 0.5, 0.1, 0.3, RHO, 1000, n)
+        
+        prices_mean.append(p_mean)
+        # Intervalle à 95% = 1.96 * Erreur Standard
+        if not np.isnan(std_err):
+            prices_ci.append(1.96 * std_err)
         else:
-            prices_mean.append(np.nan)
-            prices_std.append(np.nan)
+            prices_ci.append(np.nan)
 
     prices_mean = np.array(prices_mean)
-    ci = 1.96 * np.array(prices_std)
+    ci = np.array(prices_ci)
 
     plt.figure(figsize=(8, 5))
     plt.plot(n_sims_list, prices_mean, 'b-', marker='o', label="Prix estimé (Euler dt=1/1000)")
@@ -152,13 +147,10 @@ def fig2_gamma_distribution():
 
     for idx, alpha in enumerate(alphas):
         subprocess.run(["./gamma_test", str(alpha)], capture_output=True)
-        # FIX: Lecture depuis le fichier pour stabilité
         samples = np.loadtxt("gamma_samples.txt")
         
-        # Plot Histogramme
         axes[idx].hist(samples, bins=100, density=True, alpha=0.6, color='skyblue', edgecolor='black', label="Samples GPU")
         
-        # Plot Densité théorique
         x = np.linspace(0.01, max(samples), 500)
         y = stats.gamma.pdf(x, a=alpha, scale=1.0)
         axes[idx].plot(x, y, 'r-', lw=2, label="Théorique $\mathcal{G}(\\alpha)$")
@@ -177,8 +169,6 @@ def fig3_and_4_tradeoff_and_time():
     np.random.seed(42)
     configs = []
     
-    # FIX: Ranges conformes au PDF (Q3)
-    # kappa in[0.1, 10], theta in [0.01, 0.5], sigma in[0.1, 1.0]
     while len(configs) < 10:
         k = np.random.uniform(0.1, 10.0)
         th = np.random.uniform(0.01, 0.5)
@@ -188,10 +178,11 @@ def fig3_and_4_tradeoff_and_time():
             
     results =[]
     for i, (k, th, sig) in enumerate(configs):
-        p_ref, _ = run_heston(1, k, th, sig, RHO, 1000, 1000000)
-        p_eul, t_eul = run_heston(0, k, th, sig, RHO, 1000, 1000000)
-        p_alm1, t_alm1 = run_heston(2, k, th, sig, RHO, 1000, 1000000)
-        p_alm30, t_alm30 = run_heston(2, k, th, sig, RHO, 30, 1000000)
+        # Adaptation pour récupérer les 3 variables et ignorer l'erreur standard (_)
+        p_ref, _, _ = run_heston(1, k, th, sig, RHO, 1000, 1000000)
+        p_eul, _, t_eul = run_heston(0, k, th, sig, RHO, 1000, 1000000)
+        p_alm1, _, t_alm1 = run_heston(2, k, th, sig, RHO, 1000, 1000000)
+        p_alm30, _, t_alm30 = run_heston(2, k, th, sig, RHO, 30, 1000000)
         
         if not np.isnan(p_ref):
             results.append({
@@ -223,7 +214,6 @@ def fig3_and_4_tradeoff_and_time():
     plt.scatter(df['t_alm1000'], df['err_alm1000'], c='darkorange', marker='s', s=100, label='Presque Exact (1/1000)')
     plt.scatter(df['t_alm30'], df['err_alm30'], c='green', marker='^', s=150, label='Presque Exact (1/30)')
     
-    # FIX: Passage de X et Y en échelles log pour bien séparer le cluster dt=1/30
     plt.xscale('log')
     plt.yscale('log')
     plt.xlabel("Temps d'exécution total (ms) - Échelle log")
@@ -238,21 +228,20 @@ def fig3_and_4_tradeoff_and_time():
 def fig5_heatmap():
     print("Génération Figure 5 : Heatmap des erreurs (Presque Exact dt=1/30 vs Exact)...")
     
-    # FIX: Kappa demarre bien a 0.1
     kappas = np.linspace(0.1, 10.0, 10)
     sigmas = np.linspace(0.1, 1.0, 10)
-    theta_heatmap = 0.1 # On fige theta pour un plot en 2D
+    theta_heatmap = 0.1 
     
     error_matrix = np.zeros((len(kappas), len(sigmas)))
     
     for i, k in enumerate(kappas):
         for j, sig in enumerate(sigmas):
             if 20 * k * theta_heatmap <= sig**2:
-                error_matrix[i, j] = np.nan # Feller violée
+                error_matrix[i, j] = np.nan 
             else:
-                # Moins de sims pour calculer la matrice plus rapidement (100k)
-                p_ref, _ = run_heston(1, k, theta_heatmap, sig, RHO, 1000, 100000) 
-                p_alm30, _ = run_heston(2, k, theta_heatmap, sig, RHO, 30, 100000)
+                # Adaptation pour récupérer les 3 variables
+                p_ref, _, _ = run_heston(1, k, theta_heatmap, sig, RHO, 1000, 100000) 
+                p_alm30, _, _ = run_heston(2, k, theta_heatmap, sig, RHO, 30, 100000)
                 if not np.isnan(p_ref) and not np.isnan(p_alm30):
                     error_matrix[i, j] = abs(p_alm30 - p_ref)
                 else:
@@ -262,7 +251,6 @@ def fig5_heatmap():
     cmap = plt.colormaps.get_cmap('YlOrRd').copy()
     cmap.set_bad(color='lightgrey')
     
-    # FIX: Extent parfaitement ajusté aux min/max des tenseurs
     ext =[sigmas.min(), sigmas.max(), kappas.min(), kappas.max()]
     plt.imshow(error_matrix, origin='lower', extent=ext, aspect='auto', cmap=cmap)
     

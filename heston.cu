@@ -56,12 +56,18 @@ __device__ float generate_gamma(curandState *state, float alpha) {
 // ==========================================
 
 // KERNEL 0 : EULER
-__global__ void heston_euler(float S0, float v0, float kappa, float theta, float sigma, float rho, float K, float dt, int N_steps, int N_sims, curandState *state, float *sum_payoff) {
+__global__ void heston_euler(float S0, float v0, float kappa, float theta, float sigma, float rho, float K, float dt, int N_steps, int N_sims, curandState *state, float *sum_payoff, float *sum_sq_payoff) {
     int tid = threadIdx.x;
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
+    
+    // Division de la mémoire partagée en deux parties
     extern __shared__ float cache[];
+    float* cache_sum = cache;
+    float* cache_sum_sq = cache + blockDim.x;
+
     float local_sum = 0.0f;
+    float local_sum_sq = 0.0f;
     
     float sqrt_dt = sqrtf(dt);
     float sqrt_1_rho2 = sqrtf(1.0f - rho * rho);
@@ -82,26 +88,41 @@ __global__ void heston_euler(float S0, float v0, float kappa, float theta, float
             S = S_next;
             v = v_next;
         }
-        local_sum += fmaxf(S - K, 0.0f);
+        float payoff = fmaxf(S - K, 0.0f);
+        local_sum += payoff;
+        local_sum_sq += payoff * payoff;
     }
     if (gid < stride) state[gid] = localState;
 
-    cache[tid] = local_sum;
+    cache_sum[tid] = local_sum;
+    cache_sum_sq[tid] = local_sum_sq;
     __syncthreads();
+    
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) cache[tid] += cache[tid + s];
+        if (tid < s) {
+            cache_sum[tid] += cache_sum[tid + s];
+            cache_sum_sq[tid] += cache_sum_sq[tid + s];
+        }
         __syncthreads();
     }
-    if (tid == 0) atomicAdd(sum_payoff, cache[0]);
+    if (tid == 0) {
+        atomicAdd(sum_payoff, cache_sum[0]);
+        atomicAdd(sum_sq_payoff, cache_sum_sq[0]);
+    }
 }
 
 // KERNEL 1 : EXACT (Broadie-Kaya)
-__global__ void heston_exact(float S0, float v0, float kappa, float theta, float sigma, float rho, float K, float dt, int N_steps, int N_sims, curandState *state, float *sum_payoff) {
+__global__ void heston_exact(float S0, float v0, float kappa, float theta, float sigma, float rho, float K, float dt, int N_steps, int N_sims, curandState *state, float *sum_payoff, float *sum_sq_payoff) {
     int tid = threadIdx.x;
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
+    
     extern __shared__ float cache[];
+    float* cache_sum = cache;
+    float* cache_sum_sq = cache + blockDim.x;
+
     float local_sum = 0.0f;
+    float local_sum_sq = 0.0f;
     curandState localState;
     if (gid < stride) localState = state[gid];
 
@@ -126,26 +147,42 @@ __global__ void heston_exact(float S0, float v0, float kappa, float theta, float
         float Sigma_sq = (1.0f - rho * rho) * vI;
         float G = curand_normal(&localState);
         float S_final = S0 * expf(m + sqrtf(Sigma_sq) * G);
-        local_sum += fmaxf(S_final - K, 0.0f); 
+        
+        float payoff = fmaxf(S_final - K, 0.0f);
+        local_sum += payoff;
+        local_sum_sq += payoff * payoff;
     }
     if (gid < stride) state[gid] = localState;
 
-    cache[tid] = local_sum;
+    cache_sum[tid] = local_sum;
+    cache_sum_sq[tid] = local_sum_sq;
     __syncthreads();
+    
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) cache[tid] += cache[tid + s];
+        if (tid < s) {
+            cache_sum[tid] += cache_sum[tid + s];
+            cache_sum_sq[tid] += cache_sum_sq[tid + s];
+        }
         __syncthreads();
     }
-    if (tid == 0) atomicAdd(sum_payoff, cache[0]);
+    if (tid == 0) {
+        atomicAdd(sum_payoff, cache_sum[0]);
+        atomicAdd(sum_sq_payoff, cache_sum_sq[0]);
+    }
 }
 
 // KERNEL 2 : ALMOST EXACT
-__global__ void heston_almost(float S0, float v0, float kappa, float theta, float sigma, float rho, float K, float dt, int N_steps, int N_sims, curandState *state, float *sum_payoff) {
+__global__ void heston_almost(float S0, float v0, float kappa, float theta, float sigma, float rho, float K, float dt, int N_steps, int N_sims, curandState *state, float *sum_payoff, float *sum_sq_payoff) {
     int tid = threadIdx.x;
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
+    
     extern __shared__ float cache[];
+    float* cache_sum = cache;
+    float* cache_sum_sq = cache + blockDim.x;
+
     float local_sum = 0.0f;
+    float local_sum_sq = 0.0f;
     curandState localState;
     if (gid < stride) localState = state[gid];
 
@@ -168,21 +205,31 @@ __global__ void heston_almost(float S0, float v0, float kappa, float theta, floa
             float alpha = d + (float)N;
             float v_next = c_v_next * generate_gamma(&localState, alpha);
             
-            float G_z = curand_normal(&localState); // Représente la combinaison linéaire (rho G1 + sqrt G2)
+            float G_z = curand_normal(&localState);
             logS_t += k_0 + k_1 * v_t + k_2 * v_next + sqrtf(var_coef * v_t * dt) * G_z;
             v_t = v_next;
         }        
-        local_sum += fmaxf(expf(logS_t) - K, 0.0f);
+        float payoff = fmaxf(expf(logS_t) - K, 0.0f);
+        local_sum += payoff;
+        local_sum_sq += payoff * payoff;
     }
     if (gid < stride) state[gid] = localState;
 
-    cache[tid] = local_sum;
+    cache_sum[tid] = local_sum;
+    cache_sum_sq[tid] = local_sum_sq;
     __syncthreads();
+    
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) cache[tid] += cache[tid + s];
+        if (tid < s) {
+            cache_sum[tid] += cache_sum[tid + s];
+            cache_sum_sq[tid] += cache_sum_sq[tid + s];
+        }
         __syncthreads();
     }
-    if (tid == 0) atomicAdd(sum_payoff, cache[0]);
+    if (tid == 0) {
+        atomicAdd(sum_payoff, cache_sum[0]);
+        atomicAdd(sum_sq_payoff, cache_sum_sq[0]);
+    }
 }
 
 // ==========================================
@@ -205,13 +252,16 @@ int main(int argc, char **argv) {
     int NTPB = 256;
     int NB = 120;
     int total_threads = NB * NTPB;
-    size_t shared_mem_size = NTPB * sizeof(float);
+    
+    size_t shared_mem_size = 2 * NTPB * sizeof(float);
 
-    float *d_sum;
+    float *d_sum, *d_sum_sq;
     curandState *d_states;
     CUDA_CHECK(cudaMallocManaged(&d_sum, sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&d_sum_sq, sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_states, total_threads * sizeof(curandState)));
     *d_sum = 0.0f;
+    *d_sum_sq = 0.0f;
 
     init_curand_states<<<NB, NTPB>>>(d_states, 1234ULL);
     cudaDeviceSynchronize();
@@ -220,9 +270,9 @@ int main(int argc, char **argv) {
     cudaEventCreate(&start); cudaEventCreate(&stop);
 
     cudaEventRecord(start);
-    if (method == 0) heston_euler<<<NB, NTPB, shared_mem_size>>>(S0, v0, kappa, theta, sigma, rho, K, dt, N_steps, N_sims, d_states, d_sum);
-    else if (method == 1) heston_exact<<<NB, NTPB, shared_mem_size>>>(S0, v0, kappa, theta, sigma, rho, K, dt, N_steps, N_sims, d_states, d_sum);
-    else if (method == 2) heston_almost<<<NB, NTPB, shared_mem_size>>>(S0, v0, kappa, theta, sigma, rho, K, dt, N_steps, N_sims, d_states, d_sum);
+    if (method == 0) heston_euler<<<NB, NTPB, shared_mem_size>>>(S0, v0, kappa, theta, sigma, rho, K, dt, N_steps, N_sims, d_states, d_sum, d_sum_sq);
+    else if (method == 1) heston_exact<<<NB, NTPB, shared_mem_size>>>(S0, v0, kappa, theta, sigma, rho, K, dt, N_steps, N_sims, d_states, d_sum, d_sum_sq);
+    else if (method == 2) heston_almost<<<NB, NTPB, shared_mem_size>>>(S0, v0, kappa, theta, sigma, rho, K, dt, N_steps, N_sims, d_states, d_sum, d_sum_sq);
     
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
@@ -230,9 +280,15 @@ int main(int argc, char **argv) {
     float time_ms;
     cudaEventElapsedTime(&time_ms, start, stop);
 
-    float price = (*d_sum) / N_sims;
-    printf("%.6f,%.3f\n", price, time_ms);
+    float mean = (*d_sum) / N_sims;
+    float mean_sq = (*d_sum_sq) / N_sims;
+    float variance = fmaxf(mean_sq - (mean * mean), 0.0f);
+    float std_error = sqrtf(variance / N_sims);
 
-    cudaFree(d_states); cudaFree(d_sum);
+    printf("%.8f,%.8f,%.3f\n", mean, std_error, time_ms);
+
+    cudaFree(d_states); 
+    cudaFree(d_sum);
+    cudaFree(d_sum_sq);
     return 0;
 }

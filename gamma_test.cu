@@ -56,7 +56,6 @@
         get_gamma<<<(n+255)/256, 256>>>(d_state, alpha, d_out, n);
         cudaDeviceSynchronize();
         
-        // FIX: Ecriture dans un fichier plutot que stdout
         FILE *f = fopen("gamma_samples.txt", "w");
         for(int i=0; i<n; i++) fprintf(f, "%f\n", d_out[i]);
         fclose(f);
